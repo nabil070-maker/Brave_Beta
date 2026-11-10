@@ -27,6 +27,9 @@ jobs:
       - name: Fetch dependencies
         run: go mod tidy
 
+      - name: Embed icon and manifest
+        run: go run github.com/akavel/rsrc@v0.10.2 -arch amd64 -manifest app.manifest -ico icon.ico -o rsrc_windows_amd64.syso
+
       - name: Build
         env:
           GOOS: windows

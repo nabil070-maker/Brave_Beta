@@ -12,7 +12,7 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-var version = "0.2.1"
+var version = "0.3.0"
 
 func msgBox(title, text string, icon uint32) {
 	t, _ := windows.UTF16PtrFromString(text)

@@ -202,7 +202,50 @@ func isInstalled(p Paths) bool {
 	return err == nil
 }
 
+var errCancelled = errors.New("installation cancelled")
+
+// Reporter receives progress while installing: the setup window, or the log.
+type Reporter interface {
+	Phase(text string)
+	Progress(pct int, detail string)
+	Cancelled() bool
+}
+
+type logReporter struct{ last time.Time }
+
+func (l *logReporter) Phase(s string) { log.Println(s) }
+func (l *logReporter) Progress(pct int, detail string) {
+	if time.Since(l.last) > 3*time.Second {
+		l.last = time.Now()
+		log.Printf("%d%% %s", pct, detail)
+	}
+}
+func (l *logReporter) Cancelled() bool { return false }
+
+func fmtBytes(n int64) string {
+	if n >= 1<<30 {
+		return fmt.Sprintf("%.2f GB", float64(n)/(1<<30))
+	}
+	return fmt.Sprintf("%.1f MB", float64(n)/(1<<20))
+}
+
+func fmtDur(sec float64) string {
+	s := int(sec + 0.5)
+	if s >= 3600 {
+		return fmt.Sprintf("%d:%02d:%02d", s/3600, s%3600/60, s%60)
+	}
+	return fmt.Sprintf("%d:%02d", s/60, s%60)
+}
+
 func ensureLatest(cfg Config, p Paths, force bool) error {
+	return ensureLatestR(cfg, p, force, &logReporter{})
+}
+
+// Overall progress is split across phases: 0-2 lookup, 2-80 download,
+// 80-82 verify, 82-98 extract, 98-100 finish.
+func ensureLatestR(cfg Config, p Paths, force bool, rep Reporter) error {
+	rep.Phase("Checking for the latest Brave Beta…")
+	rep.Progress(1, "")
 	rel, asset, err := latestRelease(cfg)
 	if err != nil {
 		return err
@@ -211,6 +254,10 @@ func ensureLatest(cfg Config, p Paths, force bool) error {
 		log.Printf("already up to date (%s)", rel.TagName)
 		return nil
 	}
+	if rep.Cancelled() {
+		return errCancelled
+	}
+	version := strings.TrimPrefix(rel.TagName, "v")
 	log.Printf("installing %s (%s)", rel.TagName, asset.Name)
 
 	// clear leftovers from earlier attempts
@@ -218,38 +265,56 @@ func ensureLatest(cfg Config, p Paths, force bool) error {
 	if err := os.MkdirAll(p.Tmp, 0o755); err != nil {
 		return err
 	}
-
 	zipPath := filepath.Join(p.Tmp, asset.Name)
-	sum, err := download(asset.URL, zipPath)
+	stage := p.App + ".new"
+	cleanup := func() {
+		os.RemoveAll(stage)
+		os.RemoveAll(p.Tmp)
+		os.MkdirAll(p.Tmp, 0o755)
+	}
+
+	rep.Phase(fmt.Sprintf("Downloading Brave Beta %s…", version))
+	sum, err := download(asset.URL, zipPath, rep)
 	if err != nil {
+		cleanup()
 		return err
 	}
+
+	rep.Phase("Verifying download…")
+	rep.Progress(80, "")
 	if want := expectedSum(rel, asset); want != "" {
 		if !strings.EqualFold(want, sum) {
-			os.Remove(zipPath)
+			cleanup()
 			return fmt.Errorf("checksum mismatch: want %s got %s", want, sum)
 		}
 		log.Println("sha256 verified")
 	} else {
 		log.Printf("no checksum published, sha256=%s", sum)
 	}
+	if rep.Cancelled() {
+		cleanup()
+		return errCancelled
+	}
 
-	stage := p.App + ".new"
+	rep.Phase("Installing files…")
+	rep.Progress(82, "")
 	os.RemoveAll(stage)
-	if err := extractZip(zipPath, stage); err != nil {
-		os.RemoveAll(stage)
+	if err := extractZip(zipPath, stage, rep); err != nil {
+		cleanup()
 		return err
 	}
 	if _, err := os.Stat(filepath.Join(stage, "brave.exe")); err != nil {
-		os.RemoveAll(stage)
+		cleanup()
 		return errors.New("extraction finished but brave.exe is missing")
 	}
 
+	rep.Phase("Finishing up…")
+	rep.Progress(98, "")
 	old := p.App + ".old"
 	os.RemoveAll(old)
 	if _, err := os.Stat(p.App); err == nil {
 		if err := os.Rename(p.App, old); err != nil {
-			os.RemoveAll(stage)
+			cleanup()
 			return fmt.Errorf("could not replace app folder, close Brave first: %w", err)
 		}
 	}
@@ -257,15 +322,47 @@ func ensureLatest(cfg Config, p Paths, force bool) error {
 		return err
 	}
 	os.RemoveAll(old)
-	os.Remove(zipPath)
+	cleanup()
 	if err := os.WriteFile(stateFile(p), []byte(rel.TagName), 0o644); err != nil {
 		return err
 	}
+	rep.Progress(100, "")
 	log.Printf("installed %s, Brave %s", rel.TagName, installedVersion(p))
 	return nil
 }
 
-func download(url, dest string) (string, error) {
+type dlWriter struct {
+	rep         Reporter
+	total, done int64
+	start, last time.Time
+}
+
+func (w *dlWriter) Write(b []byte) (int, error) {
+	w.done += int64(len(b))
+	if w.rep.Cancelled() {
+		return 0, errCancelled
+	}
+	now := time.Now()
+	if now.Sub(w.last) < 200*time.Millisecond {
+		return len(b), nil
+	}
+	w.last = now
+	speed := float64(w.done) / now.Sub(w.start).Seconds()
+	pct := 2
+	detail := fmtBytes(w.done)
+	if w.total > 0 {
+		pct = 2 + int(w.done*78/w.total)
+		left := ""
+		if speed > 0 {
+			left = "  •  " + fmtDur(float64(w.total-w.done)/speed) + " left"
+		}
+		detail = fmt.Sprintf("%s of %s  •  %s/s%s", fmtBytes(w.done), fmtBytes(w.total), fmtBytes(int64(speed)), left)
+	}
+	w.rep.Progress(pct, detail)
+	return len(b), nil
+}
+
+func download(url, dest string, rep Reporter) (string, error) {
 	resp, err := httpGet(url)
 	if err != nil {
 		return "", err
@@ -277,35 +374,49 @@ func download(url, dest string) (string, error) {
 	}
 	defer f.Close()
 	h := sha256.New()
-	pr := &progress{total: resp.ContentLength, last: time.Now()}
-	if _, err := io.Copy(io.MultiWriter(f, h, pr), resp.Body); err != nil {
+	now := time.Now()
+	dl := &dlWriter{rep: rep, total: resp.ContentLength, start: now, last: now}
+	if _, err := io.Copy(io.MultiWriter(f, h, dl), resp.Body); err != nil {
 		return "", err
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-type progress struct {
+type exWriter struct {
+	rep         Reporter
 	total, done int64
 	last        time.Time
 }
 
-func (p *progress) Write(b []byte) (int, error) {
-	p.done += int64(len(b))
-	if time.Since(p.last) > 3*time.Second {
-		p.last = time.Now()
-		if p.total > 0 {
-			log.Printf("downloaded %d%%", p.done*100/p.total)
-		}
+func (w *exWriter) Write(b []byte) (int, error) {
+	w.done += int64(len(b))
+	if w.rep.Cancelled() {
+		return 0, errCancelled
 	}
+	now := time.Now()
+	if now.Sub(w.last) < 200*time.Millisecond {
+		return len(b), nil
+	}
+	w.last = now
+	pct := 82
+	if w.total > 0 {
+		pct = 82 + int(w.done*16/w.total)
+	}
+	w.rep.Progress(pct, fmt.Sprintf("%s of %s", fmtBytes(w.done), fmtBytes(w.total)))
 	return len(b), nil
 }
 
-func extractZip(zipPath, stage string) error {
+func extractZip(zipPath, stage string, rep Reporter) error {
 	r, err := zip.OpenReader(zipPath)
 	if err != nil {
 		return err
 	}
 	defer r.Close()
+	var total int64
+	for _, f := range r.File {
+		total += int64(f.UncompressedSize64)
+	}
+	ew := &exWriter{rep: rep, total: total, last: time.Now()}
 	cleanStage := filepath.Clean(stage) + string(os.PathSeparator)
 	for _, f := range r.File {
 		target := filepath.Join(stage, filepath.FromSlash(f.Name))
@@ -321,14 +432,14 @@ func extractZip(zipPath, stage string) error {
 		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 			return err
 		}
-		if err := writeZipEntry(f, target); err != nil {
+		if err := writeZipEntry(f, target, ew); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func writeZipEntry(f *zip.File, target string) error {
+func writeZipEntry(f *zip.File, target string, ew *exWriter) error {
 	rc, err := f.Open()
 	if err != nil {
 		return err
@@ -339,6 +450,6 @@ func writeZipEntry(f *zip.File, target string) error {
 		return err
 	}
 	defer out.Close()
-	_, err = io.Copy(out, rc)
+	_, err = io.Copy(out, io.TeeReader(rc, ew))
 	return err
 }

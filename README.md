@@ -8,9 +8,20 @@ after exit so the host PC stays clean.
 
     build.bat          (or: powershell -ExecutionPolicy Bypass -File build.ps1)
 
+The build embeds `icon.ico` and `app.manifest` using rsrc (downloaded automatically by `go run`).
+GitHub Actions does the same, see .github/workflows/build.yml.
+
 Outputs in `dist\`:
 - `brave-beta-portable.exe`        release build, no console window
 - `brave-beta-portable-debug.exe`  console build, shows live logs
+
+## What you get
+
+- The exe carries the real Brave Beta icon (extracted from Brave's own Beta build) and a manifest
+  (visual styles, sharp text on high-DPI screens, no UAC prompt).
+- First run opens a small setup window: welcome page, then download/extract progress with
+  speed and time left, then a finish page with a "Launch Brave Beta" checkbox. Cancel works at any point.
+- If `check_updates: true` and a newer Beta exists, the same window shows the update and then launches Brave.
 
 ## Use
 

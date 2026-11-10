@@ -43,16 +43,12 @@ func run(cfg Config, p Paths, extra []string) error {
 
 	if !already {
 		if !isInstalled(p) {
-			msgBox("Brave Beta Portable",
-				"Brave Beta is not installed yet.\nIt will be downloaded now (about 250 MB). Click OK to start; Brave opens automatically when done.",
-				windows.MB_ICONINFORMATION)
-			if err := ensureLatest(cfg, p, true); err != nil {
-				return err
+			installed, launch := installerUI(cfg, p, false)
+			if !installed || !launch {
+				return nil
 			}
-		} else if cfg.CheckUpdates {
-			if err := ensureLatest(cfg, p, false); err != nil {
-				log.Printf("update check failed (continuing): %v", err)
-			}
+		} else if cfg.CheckUpdates && updateAvailable(cfg, p) {
+			installerUI(cfg, p, true) // result ignored: launch whatever is installed
 		}
 	}
 
@@ -81,4 +77,13 @@ func run(cfg Config, p Paths, extra []string) error {
 	registryExport(cfg, p, owned)
 	log.Println("Brave exited")
 	return err
+}
+
+func updateAvailable(cfg Config, p Paths) bool {
+	rel, _, err := latestRelease(cfg)
+	if err != nil {
+		log.Printf("update check failed: %v", err)
+		return false
+	}
+	return installedTag(p) != rel.TagName
 }

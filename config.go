@@ -3,13 +3,14 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
 
 type Config struct {
 	Repo          string   `yaml:"repo"`
-	ReleaseMatch  string   `yaml:"release_match"`
+	MarkerPattern string   `yaml:"marker_pattern"`
 	AssetPattern  string   `yaml:"asset_pattern"`
 	CheckUpdates  bool     `yaml:"check_updates"`
 	CleanRegistry bool     `yaml:"clean_registry"`
@@ -46,8 +47,8 @@ func newPaths() (Paths, error) {
 func defaultConfig() Config {
 	return Config{
 		Repo:          "brave/brave-browser",
-		ReleaseMatch:  `(?i)beta`,
-		AssetPattern:  `(?i)^BraveBrowserStandaloneBetaSetup\.exe$`,
+		MarkerPattern: `(?i)^BraveBrowserStandaloneBetaSetup\.exe$`,
+		AssetPattern:  `(?i)^brave-v\d+(\.\d+)+-win32-x64\.zip$`,
 		CheckUpdates:  false,
 		CleanRegistry: true,
 		RegistryKeys:  []string{`HKCU\Software\BraveSoftware\Brave-Browser-Beta`},
@@ -60,8 +61,10 @@ func defaultConfig() Config {
 
 const sampleYML = `# Brave Beta Portable config
 repo: brave/brave-browser
-release_match: '(?i)beta'
-asset_pattern: '(?i)^BraveBrowserStandaloneBetaSetup\.exe$'
+# A release counts as Beta if it contains an asset matching marker_pattern.
+marker_pattern: '(?i)^BraveBrowserStandaloneBetaSetup\.exe$'
+# The portable zip we download from that release.
+asset_pattern: '(?i)^brave-v\d+(\.\d+)+-win32-x64\.zip$'
 
 # Auto-update at launch (when no other instance is running)
 check_updates: false
@@ -92,5 +95,9 @@ func loadConfig(p Paths) (Config, error) {
 		return cfg, err
 	}
 	err = yaml.Unmarshal(b, &cfg)
+	// Old configs pointed at the installer, which can no longer be extracted.
+	if strings.Contains(cfg.AssetPattern, "Standalone") {
+		cfg.AssetPattern = defaultConfig().AssetPattern
+	}
 	return cfg, err
 }

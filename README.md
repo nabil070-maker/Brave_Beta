@@ -1,6 +1,6 @@
 # Brave Beta Portable
 
-A Portapps-style launcher written in Go. It downloads the latest Brave Beta,
+A Portapps-style launcher written in Go. It downloads the latest official Brave Beta zip build from GitHub,
 extracts it into `app\`, keeps your profile in `data\`, and cleans the registry
 after exit so the host PC stays clean.
 
@@ -36,8 +36,8 @@ Commands (run from a terminal, ideally with the debug exe):
 
 ## Config (brave-beta-portable.yml)
 
-- asset_pattern: regex for the installer asset name on the GitHub release.
-  If install fails with "no matching Beta asset", the error lists real names.
+- marker_pattern / asset_pattern: a release counts as Beta if it has a marker asset;
+  asset_pattern picks the portable zip. If install fails, the error lists real names.
 - check_updates: auto-update at launch.
 - clean_registry / registry_keys: keys exported to reg\ and deleted after exit.
   Keys already present on the host are never touched.

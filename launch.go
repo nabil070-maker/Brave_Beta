@@ -44,7 +44,7 @@ func run(cfg Config, p Paths, extra []string) error {
 	if !already {
 		if !isInstalled(p) {
 			msgBox("Brave Beta Portable",
-				"Brave Beta is not installed yet.\nIt will be downloaded now (about 150 MB). Click OK to start; Brave opens automatically when done.",
+				"Brave Beta is not installed yet.\nIt will be downloaded now (about 250 MB). Click OK to start; Brave opens automatically when done.",
 				windows.MB_ICONINFORMATION)
 			if err := ensureLatest(cfg, p, true); err != nil {
 				return err

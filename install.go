@@ -1,7 +1,7 @@
 package main
 
 import (
-	"bytes"
+	"archive/zip"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -15,8 +15,6 @@ import (
 	"regexp"
 	"strings"
 	"time"
-
-	"github.com/bodgit/sevenzip"
 )
 
 type ghAsset struct {
@@ -35,7 +33,9 @@ type ghRelease struct {
 func httpGet(url string) (*http.Response, error) {
 	req, _ := http.NewRequest("GET", url, nil)
 	req.Header.Set("User-Agent", "brave-beta-portable/"+version)
-	req.Header.Set("Accept", "application/vnd.github+json")
+	if strings.Contains(url, "api.github.com") {
+		req.Header.Set("Accept", "application/vnd.github+json")
+	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return nil, err
@@ -47,8 +47,10 @@ func httpGet(url string) (*http.Response, error) {
 	return resp, nil
 }
 
+// Finds the newest non-draft release that contains both a Beta marker asset
+// and the portable zip, and returns that zip asset.
 func latestRelease(cfg Config) (*ghRelease, *ghAsset, error) {
-	relRe, err := regexp.Compile(cfg.ReleaseMatch)
+	markerRe, err := regexp.Compile(cfg.MarkerPattern)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -68,20 +70,48 @@ func latestRelease(cfg Config) (*ghRelease, *ghAsset, error) {
 	var seen []string
 	for i := range rels {
 		r := &rels[i]
-		if r.Draft || !(relRe.MatchString(r.Name) || relRe.MatchString(r.TagName)) {
+		if r.Draft {
 			continue
 		}
+		marker := false
+		var zipAsset *ghAsset
 		for j := range r.Assets {
 			a := &r.Assets[j]
-			seen = append(seen, a.Name)
+			if len(seen) < 25 {
+				seen = append(seen, a.Name)
+			}
+			if markerRe.MatchString(a.Name) {
+				marker = true
+			}
 			if assetRe.MatchString(a.Name) {
-				return r, a, nil
+				zipAsset = a
 			}
 		}
-		// the newest matching release had no matching asset: report it
-		break
+		if marker && zipAsset != nil {
+			return r, zipAsset, nil
+		}
 	}
-	return nil, nil, fmt.Errorf("no matching Beta asset found. Assets seen: %v. Adjust asset_pattern in the yml", seen)
+	return nil, nil, fmt.Errorf("no Beta zip found. Some assets seen: %v. Adjust marker_pattern/asset_pattern in the yml", seen)
+}
+
+func expectedSum(rel *ghRelease, a *ghAsset) string {
+	if strings.HasPrefix(a.Digest, "sha256:") {
+		return strings.TrimPrefix(a.Digest, "sha256:")
+	}
+	for _, s := range rel.Assets {
+		if s.Name == a.Name+".sha256" {
+			resp, err := httpGet(s.URL)
+			if err != nil {
+				return ""
+			}
+			defer resp.Body.Close()
+			b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+			if f := strings.Fields(string(b)); len(f) > 0 {
+				return f[0]
+			}
+		}
+	}
+	return ""
 }
 
 func stateFile(p Paths) string { return filepath.Join(p.Root, "installed.txt") }
@@ -110,25 +140,30 @@ func ensureLatest(cfg Config, p Paths, force bool) error {
 	}
 	log.Printf("installing %s (%s)", rel.TagName, asset.Name)
 
-	installer := filepath.Join(p.Tmp, asset.Name)
-	sum, err := download(asset.URL, installer)
+	// clear leftovers from earlier attempts
+	os.RemoveAll(p.Tmp)
+	if err := os.MkdirAll(p.Tmp, 0o755); err != nil {
+		return err
+	}
+
+	zipPath := filepath.Join(p.Tmp, asset.Name)
+	sum, err := download(asset.URL, zipPath)
 	if err != nil {
 		return err
 	}
-	if strings.HasPrefix(asset.Digest, "sha256:") {
-		want := strings.TrimPrefix(asset.Digest, "sha256:")
+	if want := expectedSum(rel, asset); want != "" {
 		if !strings.EqualFold(want, sum) {
-			os.Remove(installer)
+			os.Remove(zipPath)
 			return fmt.Errorf("checksum mismatch: want %s got %s", want, sum)
 		}
 		log.Println("sha256 verified")
 	} else {
-		log.Printf("no digest published, sha256=%s", sum)
+		log.Printf("no checksum published, sha256=%s", sum)
 	}
 
 	stage := p.App + ".new"
 	os.RemoveAll(stage)
-	if err := extractInstaller(installer, stage); err != nil {
+	if err := extractZip(zipPath, stage); err != nil {
 		os.RemoveAll(stage)
 		return err
 	}
@@ -149,7 +184,7 @@ func ensureLatest(cfg Config, p Paths, force bool) error {
 		return err
 	}
 	os.RemoveAll(old)
-	os.Remove(installer)
+	os.Remove(zipPath)
 	if err := os.WriteFile(stateFile(p), []byte(rel.TagName), 0o644); err != nil {
 		return err
 	}
@@ -192,51 +227,17 @@ func (p *progress) Write(b []byte) (int, error) {
 	return len(b), nil
 }
 
-// The standalone installer is a PE file with chrome.7z embedded as a resource.
-// We find the 7z signature inside it and read the archive directly.
-var sevenZipSig = []byte{0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C}
-
-func extractInstaller(installer, stage string) error {
-	data, err := os.ReadFile(installer)
+func extractZip(zipPath, stage string) error {
+	r, err := zip.OpenReader(zipPath)
 	if err != nil {
 		return err
 	}
-	start := 0
-	for {
-		i := bytes.Index(data[start:], sevenZipSig)
-		if i < 0 {
-			return errors.New("chrome.7z not found inside installer")
-		}
-		off := start + i
-		err := extractBlob(data[off:], stage)
-		if err == nil {
-			return nil
-		}
-		log.Printf("candidate at offset %d failed: %v", off, err)
-		os.RemoveAll(stage)
-		start = off + 1
-	}
-}
-
-func extractBlob(blob []byte, stage string) error {
-	r, err := sevenzip.NewReader(bytes.NewReader(blob), int64(len(blob)))
-	if err != nil {
-		return err
-	}
+	defer r.Close()
 	cleanStage := filepath.Clean(stage) + string(os.PathSeparator)
-	found := false
 	for _, f := range r.File {
-		name := filepath.ToSlash(f.Name)
-		if !strings.HasPrefix(name, "Chrome-bin/") {
-			continue
-		}
-		rel := strings.TrimPrefix(name, "Chrome-bin/")
-		if rel == "" {
-			continue
-		}
-		target := filepath.Join(stage, filepath.FromSlash(rel))
+		target := filepath.Join(stage, filepath.FromSlash(f.Name))
 		if !strings.HasPrefix(target, cleanStage) {
-			return fmt.Errorf("unsafe path in archive: %q", name)
+			return fmt.Errorf("unsafe path in archive: %q", f.Name)
 		}
 		if f.FileInfo().IsDir() {
 			if err := os.MkdirAll(target, 0o755); err != nil {
@@ -247,24 +248,20 @@ func extractBlob(blob []byte, stage string) error {
 		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 			return err
 		}
-		if err := writeEntry(f, target); err != nil {
+		if err := writeZipEntry(f, target); err != nil {
 			return err
 		}
-		found = true
-	}
-	if !found {
-		return errors.New("archive has no Chrome-bin folder")
 	}
 	return nil
 }
 
-func writeEntry(f *sevenzip.File, target string) error {
+func writeZipEntry(f *zip.File, target string) error {
 	rc, err := f.Open()
 	if err != nil {
 		return err
 	}
 	defer rc.Close()
-	out, err := os.Create(target)
+	out, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
 	if err != nil {
 		return err
 	}
